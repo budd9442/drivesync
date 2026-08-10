@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drivesync"
+version = "0.1.0"
+description = "Lightweight, zero-admin Windows background continuous sync service to Google Drive via rclone"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "watchfiles>=0.20.0"
+]
+
+[project.scripts]
+drivesync = "drivesync.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
