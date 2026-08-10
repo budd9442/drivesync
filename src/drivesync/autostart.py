@@ -13,7 +13,9 @@ REG_VAL_NAME = "DriveSync"
 def _get_daemon_command() -> str:
     """Construct command to run daemon in background."""
     python_exe = sys.executable
-    return f'"{python_exe}" -m drivesync.daemon start'
+    if getattr(sys, "frozen", False):
+        return f'"{python_exe}" daemon'
+    return f'"{python_exe}" -m drivesync.daemon'
 
 
 def enable_autostart() -> bool:

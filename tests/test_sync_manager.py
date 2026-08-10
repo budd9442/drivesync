@@ -30,6 +30,7 @@ class TestSyncManager(unittest.TestCase):
         self.assertFalse(is_transient_error("File does not exist"))
 
     def test_circuit_breaker_tripping(self):
+        self.config.set("circuit_breaker_enabled", True)
         # Seed 60 pending deletions (exceeding default max 50)
         for i in range(60):
             p = f"C:\\data\\file_{i}.txt"

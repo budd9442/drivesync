@@ -3,6 +3,7 @@ import os
 import pathlib
 import secrets
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 DEFAULT_IGNORE_PATTERNS = [
@@ -40,20 +41,54 @@ class Config:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
+        if not self.log_path.exists():
+            try:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                with open(self.log_path, "w", encoding="utf-8") as f:
+                    f.write(f"[{timestamp}] [INFO] [drivesync]: DriveSync log file initialized.\n")
+            except Exception:
+                pass
+
         self._data: Dict[str, Any] = {}
         self.load()
 
     def _auto_detect_rclone_binary(self) -> str:
-        from drivesync.rclone_installer import ensure_rclone_binary
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bundled = pathlib.Path(meipass) / "rclone.exe"
+            if bundled.exists():
+                return str(bundled.resolve())
+
+        exe_dir_rclone = pathlib.Path(sys.executable).parent / "rclone.exe"
+        if exe_dir_rclone.exists():
+            return str(exe_dir_rclone.resolve())
+
+        base_rclone = self.base_dir / "rclone.exe"
+        if base_rclone.exists():
+            return str(base_rclone.resolve())
 
         dev_rclone = pathlib.Path.cwd() / "rclone.exe"
         if dev_rclone.exists():
             return str(dev_rclone.resolve())
 
-        detected = ensure_rclone_binary(target_dir=self.base_dir)
-        return detected or "rclone"
+        import shutil
+        path_rclone = shutil.which("rclone")
+        if path_rclone:
+            return path_rclone
+
+        return str(base_rclone.resolve())
 
     def _auto_detect_rclone_conf(self) -> str:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bundled = pathlib.Path(meipass) / "rclone.conf"
+            if bundled.exists():
+                return str(bundled.resolve())
+
+        exe_dir_conf = pathlib.Path(sys.executable).parent / "rclone.conf"
+        if exe_dir_conf.exists():
+            return str(exe_dir_conf.resolve())
+
         dev_conf = pathlib.Path.cwd() / "rclone.conf"
         if dev_conf.exists():
             return str(dev_conf.resolve())
@@ -73,8 +108,11 @@ class Config:
             "rc_pass": secrets.token_hex(16),
             "stability_seconds": 2.0,
             "retention_days": 7,
+            "circuit_breaker_enabled": False,
             "circuit_breaker_max_deletes": 50,
             "circuit_breaker_max_percent": 20.0,
+            "client_id": "",
+            "client_secret": "",
             "ignore_patterns": DEFAULT_IGNORE_PATTERNS.copy(),
             "reconciliation_interval": 300,
             "bisync_enabled": True,

@@ -84,11 +84,19 @@ class SyncManager:
         """
         Circuit Breaker Safety Mechanism.
         Halts automatic deletion sync if pending deletions exceed safety threshold.
+        Disabled by default.
         """
+        cb_enabled = self.config.get("circuit_breaker_enabled", False)
+        if not cb_enabled:
+            return False
+
         if self.storage.is_circuit_breaker_tripped():
-            logger.warning(
-                "Circuit Breaker is currently TRIPPED. Deletion sync halted until approved via CLI: 'drivesync circuit-breaker approve'."
-            )
+            now = time.time()
+            if now - getattr(self, "_last_cb_warn_time", 0.0) >= 60.0:
+                self._last_cb_warn_time = now
+                logger.warning(
+                    "Circuit Breaker is currently TRIPPED. Deletion sync halted until approved via CLI: 'drivesync circuit-breaker approve'."
+                )
             return True
 
         pending_deletions = self.storage.count_pending_deletions()
@@ -170,6 +178,10 @@ class SyncManager:
                     success, error_msg = self.rclone_client.delete_file(
                         remote_name, remote_full_path
                     )
+                    if not success and ("object not found" in error_msg.lower() or "not found" in error_msg.lower()):
+                        # Remote file is already gone; treat deletion as success
+                        success = True
+                        error_msg = ""
                 else:
                     error_msg = ""
                 is_perm = not is_transient_error(error_msg) if not success else False

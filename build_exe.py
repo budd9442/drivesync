@@ -19,13 +19,30 @@ def build_exe():
     project_root = pathlib.Path(__file__).parent.resolve()
     cli_entry = project_root / "src" / "drivesync" / "cli.py"
 
+    dist_dir = project_root / "dist"
+    target_exe = dist_dir / "drivesync.exe"
+    exe_name = "drivesync"
+
+    if target_exe.exists():
+        try:
+            target_exe.unlink()
+        except OSError:
+            import time
+            subprocess.run(["taskkill", "/F", "/IM", "drivesync.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+            try:
+                target_exe.unlink()
+            except OSError:
+                print("[!] dist/drivesync.exe is locked by another user session. Building dist/drivesync_app.exe instead...")
+                exe_name = "drivesync_app"
+
     cmd = [
         sys.executable,
         "-m",
         "PyInstaller",
         "--onefile",
         "--name",
-        "drivesync",
+        exe_name,
         "--clean",
         "--paths",
         str(project_root / "src"),

@@ -122,6 +122,7 @@ class TestDriveSyncChaosAndEdgeCases(unittest.TestCase):
     def test_chaos_3_mass_deletion_circuit_breaker(self):
         """CHAOS 3: Mass folder wipe exceeding safety threshold & CLI approval workflow."""
         print("\n[CHAOS TEST 3] Mass Deletion Circuit Breaker & Resume...")
+        self.config.set("circuit_breaker_enabled", True)
 
         # Seed manifest with 100 tracked files
         with self.storage.get_connection() as conn:

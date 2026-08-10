@@ -65,13 +65,15 @@ class RcloneClient:
 
         logger.info(f"Starting rclone daemon: {' '.join(cmd)}")
         try:
-            # Creation flag for non-window process on Windows
-            creation_flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+            # Creation flag for non-window detached process on Windows
+            creation_flags = 0x08000000 | 0x00000008 | 0x00000200 if os.name == "nt" else 0
             self.process = subprocess.Popen(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=creation_flags,
+                close_fds=True,
             )
 
             # Wait for daemon startup
@@ -251,10 +253,12 @@ class RcloneClient:
             creation_flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
             res = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 creationflags=creation_flags,
+                close_fds=True,
                 timeout=300.0,
             )
             if res.returncode == 0:

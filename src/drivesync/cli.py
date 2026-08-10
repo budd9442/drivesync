@@ -18,13 +18,18 @@ def get_daemon_pid(config: Config) -> Optional[int]:
     try:
         with open(config.pid_path, "r", encoding="utf-8") as f:
             pid = int(f.read().strip())
-        # Check if process is running
+        # Check if process is running via native OS APIs (zero sub-process overhead, no hanging)
         if os.name == "nt":
-            # Using tasklist or OpenProcess check
-            cmd = f'tasklist /FI "PID eq {pid}" /NH'
-            out = subprocess.check_output(cmd, shell=True).decode("utf-8", errors="ignore")
-            if str(pid) in out:
-                return pid
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h_process = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if h_process:
+                exit_code = ctypes.c_ulong()
+                success = ctypes.windll.kernel32.GetExitCodeProcess(h_process, ctypes.byref(exit_code))
+                ctypes.windll.kernel32.CloseHandle(h_process)
+                if success and exit_code.value == STILL_ACTIVE:
+                    return pid
         else:
             os.kill(pid, 0)
             return pid
@@ -36,9 +41,14 @@ def get_daemon_pid(config: Config) -> Optional[int]:
 def cmd_auth_login(args: argparse.Namespace, config: Config) -> None:
     rclone_bin = config.get("rclone_binary")
     rclone_conf = config.get("rclone_conf")
-    remote_name = args.remote_path or config.get("rclone_remote", "gdrive")
+    remote_name = getattr(args, "remote_path", None) or config.get("rclone_remote", "gdrive")
+
+    client_id = config.get("client_id", "")
+    client_secret = config.get("client_secret", "")
 
     print(f"Launching Google Drive OAuth consent flow via rclone ({remote_name})...")
+    if client_id and client_secret:
+        print(f"  Using Custom OAuth Client ID: {client_id[:12]}...")
     print("rclone will open your web browser to authenticate with Google Drive.\n")
 
     cmd = [
@@ -47,8 +57,11 @@ def cmd_auth_login(args: argparse.Namespace, config: Config) -> None:
         "create",
         remote_name,
         "drive",
-        f"--config={rclone_conf}",
     ]
+    if client_id and client_secret:
+        cmd.extend([f"client_id={client_id}", f"client_secret={client_secret}"])
+
+    cmd.append(f"--config={rclone_conf}")
 
     try:
         res = subprocess.run(cmd)
@@ -59,6 +72,44 @@ def cmd_auth_login(args: argparse.Namespace, config: Config) -> None:
             print(f"\n[ERROR] rclone config returned code {res.returncode}")
     except Exception as e:
         print(f"\n[ERROR] Failed to run rclone login command: {e}")
+
+
+def cmd_auth_set_credentials(args: argparse.Namespace, config: Config) -> None:
+    client_id = args.client_id.strip() if args.client_id else ""
+    client_secret = args.client_secret.strip() if args.client_secret else ""
+
+    if not client_id or not client_secret:
+        print("[ERROR] Both --client-id and --client-secret must be provided.")
+        return
+
+    config.set("client_id", client_id)
+    config.set("client_secret", client_secret)
+
+    rclone_conf = pathlib.Path(config.get("rclone_conf"))
+    remote_name = config.get("rclone_remote", "gdrive")
+
+    if rclone_conf.exists():
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read(rclone_conf, encoding="utf-8")
+            if not cp.has_section(remote_name):
+                cp.add_section(remote_name)
+            cp.set(remote_name, "type", "drive")
+            cp.set(remote_name, "scope", "drive")
+            cp.set(remote_name, "client_id", client_id)
+            cp.set(remote_name, "client_secret", client_secret)
+            if cp.has_option(remote_name, "token"):
+                cp.remove_option(remote_name, "token")
+            with open(rclone_conf, "w", encoding="utf-8") as f:
+                cp.write(f)
+        except Exception as e:
+            print(f"[WARNING] Could not write rclone.conf directly: {e}")
+
+    print("[SUCCESS] Custom Google OAuth credentials saved.")
+    print(f"  Client ID:     {client_id[:12]}...")
+    print("  Client Secret: [STORED]")
+    print("[AUTH INVALIDATED] Existing stored token cleared. Please log in again using 'drivesync auth login'.")
 
 
 def cmd_auth_status(args: argparse.Namespace, config: Config) -> None:
@@ -139,28 +190,86 @@ def cmd_folders_list(args: argparse.Namespace, config: Config) -> None:
         print(f"{f['local_path']:<50} {f['remote_path']:<30}")
 
 
+def cmd_daemon_run(args: argparse.Namespace, config: Config) -> None:
+    try:
+        rclone_bin = config.get("rclone_binary")
+        if not os.path.exists(rclone_bin) and rclone_bin != "rclone":
+            from drivesync.rclone_installer import ensure_rclone_binary
+            rclone_bin = ensure_rclone_binary(target_dir=config.base_dir) or "rclone"
+            config.set("rclone_binary", rclone_bin)
+
+        from drivesync.daemon import DriveSyncDaemon
+        daemon = DriveSyncDaemon(config)
+        daemon.start()
+    except Exception as e:
+        try:
+            config.log_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(config.log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] [CRITICAL] [drivesync]: Daemon startup crash: {e}\n")
+        except Exception:
+            pass
+        sys.exit(1)
+
+
 def cmd_start(args: argparse.Namespace, config: Config) -> None:
     pid = get_daemon_pid(config)
     if pid is not None:
         print(f"DriveSync daemon is already running (PID: {pid}).")
         return
 
-    print("Starting DriveSync background daemon...")
-    python_exe = sys.executable
+    # Check and ensure rclone binary is present before spawning daemon
+    rclone_bin = config.get("rclone_binary")
+    if not os.path.exists(rclone_bin) and rclone_bin != "rclone":
+        from drivesync.rclone_installer import ensure_rclone_binary
+        print("[*] rclone binary missing. Downloading official rclone binary...")
+        rclone_bin = ensure_rclone_binary(target_dir=config.base_dir) or "rclone"
+        config.set("rclone_binary", rclone_bin)
 
-    creation_flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-    cmd = [python_exe, "-m", "drivesync.daemon"]
+    print("Starting DriveSync background daemon...")
+    is_frozen = getattr(sys, "frozen", False)
+    if is_frozen:
+        cmd = [sys.executable, "daemon"]
+    else:
+        cmd = [sys.executable, "-m", "drivesync.daemon"]
+
+    if getattr(args, "debug", False):
+        print(f"[DEBUG] Spawning daemon command: {cmd}")
+
+    env = os.environ.copy()
+    # Strip PyInstaller internal environment variables so child daemon process extracts its own independent temp directory
+    env.pop("_MEIPASS2", None)
+    env.pop("_MEIPASS", None)
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-        )
+        config.log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            flags = 0x08000000 | 0x00000008 | 0x00000200 | 0x01000000 if os.name == "nt" else 0
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                close_fds=True,
+                env=env,
+            )
+        except Exception:
+            flags = 0x08000000 | 0x00000008 | 0x00000200 if os.name == "nt" else 0
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                close_fds=True,
+                env=env,
+            )
         time.sleep(1.0)
         new_pid = get_daemon_pid(config)
         print(f"[SUCCESS] DriveSync daemon started (PID: {new_pid or proc.pid}).")
+        sys.stdout.flush()
+        return
     except Exception as e:
         print(f"[ERROR] Failed to start daemon: {e}")
 
@@ -174,11 +283,21 @@ def cmd_stop(args: argparse.Namespace, config: Config) -> None:
     print(f"Stopping DriveSync daemon (PID: {pid})...")
     try:
         if os.name == "nt":
-            subprocess.run(f"taskkill /PID {pid} /F", shell=True, check=False)
+            import ctypes
+            PROCESS_TERMINATE = 1
+            h_process = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if h_process:
+                ctypes.windll.kernel32.TerminateProcess(h_process, 0)
+                ctypes.windll.kernel32.CloseHandle(h_process)
+            else:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         else:
             os.kill(pid, 15)
         if config.pid_path.exists():
-            config.pid_path.unlink()
+            try:
+                config.pid_path.unlink()
+            except Exception:
+                pass
         print("[SUCCESS] DriveSync daemon stopped.")
     except Exception as e:
         print(f"[ERROR] Failed to stop daemon: {e}")
@@ -224,12 +343,41 @@ def cmd_circuit_breaker(args: argparse.Namespace, config: Config) -> None:
     action = args.cb_action.lower()
     storage = Storage(config.db_path)
 
-    if action == "status":
+    if action == "enable":
+        config.set("circuit_breaker_enabled", True)
+        print("[SUCCESS] Circuit Breaker safety protection ENABLED.")
+    elif action == "disable":
+        config.set("circuit_breaker_enabled", False)
+        storage.set_circuit_breaker_tripped(False)
+        print("[SUCCESS] Circuit Breaker safety protection DISABLED. Deletion sync will run uninhibited.")
+    elif action == "set-percent":
+        val = float(args.value)
+        if val <= 0.0 or val > 100.0:
+            print("[ERROR] Percentage must be between 0.1 and 100.0")
+            return
+        config.set("circuit_breaker_max_percent", val)
+        print(f"[SUCCESS] Circuit Breaker max deletion threshold percentage updated to {val}%.")
+    elif action == "set-max":
+        val = int(args.value)
+        if val <= 0:
+            print("[ERROR] Max deletion count must be greater than 0")
+            return
+        config.set("circuit_breaker_max_deletes", val)
+        print(f"[SUCCESS] Circuit Breaker max deletion file count threshold updated to {val} files.")
+    elif action == "status":
+        enabled = config.get("circuit_breaker_enabled", False)
         tripped = storage.is_circuit_breaker_tripped()
         deletions = storage.count_pending_deletions()
-        print(f"Circuit Breaker State: {'TRIPPED' if tripped else 'OK'}")
+        max_deletes = config.get("circuit_breaker_max_deletes", 50)
+        max_percent = config.get("circuit_breaker_max_percent", 20.0)
+
+        print("=== Circuit Breaker Status ===")
+        print(f"Protection State:     {'ENABLED' if enabled else 'DISABLED (Default)'}")
+        print(f"Tripped State:        {'TRIPPED (HALTED)' if (enabled and tripped) else 'OK (Active)'}")
+        print(f"Max Delete Count:     {max_deletes} files")
+        print(f"Max Delete Percent:   {max_percent}%")
         print(f"Pending Deletions:    {deletions}")
-    elif action == "approve" or action == "reset":
+    elif action in ("approve", "reset"):
         storage.set_circuit_breaker_tripped(False)
         print("[SUCCESS] Circuit breaker approved and reset. Pending deletion sync resumed.")
 
@@ -307,6 +455,21 @@ def cmd_logs(args: argparse.Namespace, config: Config) -> None:
         tail = lines[-tail_lines:] if len(lines) >= tail_lines else lines
         print("".join(tail), end="")
 
+    if getattr(args, "follow", False):
+        print("\n--- Following log updates in real-time (Press Ctrl+C to stop) ---")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(0, os.SEEK_END)
+                while True:
+                    line = f.readline()
+                    if line:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    else:
+                        time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\nLog tail stopped.")
+
 
 def cmd_resync(args: argparse.Namespace, config: Config) -> None:
     storage = Storage(config.db_path)
@@ -367,6 +530,7 @@ def main():
         prog="drivesync",
         description="DriveSync - Zero-admin continuous Google Drive folder sync for Windows",
     )
+    parser.add_argument("--debug", "-v", action="store_true", help="Enable verbose debug logging")
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     # Auth subparser
@@ -376,6 +540,9 @@ def main():
     login_p.add_argument("--remote-path", help="Remote name to configure (default: gdrive)")
     auth_sub.add_parser("status", help="Check Google Drive auth status")
     auth_sub.add_parser("clear", help="Clear stored Google Drive credentials and log out")
+    cred_p = auth_sub.add_parser("credentials", help="Set custom Google OAuth Client ID & Secret")
+    cred_p.add_argument("--client-id", required=True, help="Google OAuth Client ID")
+    cred_p.add_argument("--client-secret", required=True, help="Google OAuth Client Secret")
 
     # Folders subparser
     folders_parser = subparsers.add_parser("folders", help="Manage watched local folders")
@@ -391,6 +558,7 @@ def main():
     subparsers.add_parser("start", help="Start background sync service")
     subparsers.add_parser("stop", help="Stop background sync service")
     subparsers.add_parser("status", help="Show current daemon and queue status")
+    subparsers.add_parser("daemon", help="Run background sync daemon process (internal)")
 
     # Resync subcommand
     resync_p = subparsers.add_parser("resync", help="Run manual 2-way rclone bisync --resync")
@@ -405,8 +573,19 @@ def main():
     autostart_parser.add_argument("action", choices=["enable", "disable", "status"])
 
     # Circuit Breaker subparser
-    cb_parser = subparsers.add_parser("circuit-breaker", help="Manage circuit breaker state")
-    cb_parser.add_argument("cb_action", choices=["approve", "status", "reset"])
+    cb_parser = subparsers.add_parser("circuit-breaker", help="Manage circuit breaker state & thresholds")
+    cb_sub = cb_parser.add_subparsers(dest="cb_action")
+    cb_sub.add_parser("enable", help="Enable Circuit Breaker deletion safety protection")
+    cb_sub.add_parser("disable", help="Disable Circuit Breaker deletion safety protection")
+    cb_sub.add_parser("status", help="Show Circuit Breaker configuration & status")
+    cb_sub.add_parser("approve", help="Approve pending deletions and reset tripped breaker")
+    cb_sub.add_parser("reset", help="Reset tripped breaker")
+
+    set_pct_p = cb_sub.add_parser("set-percent", help="Set max deletion threshold percentage (e.g. 30)")
+    set_pct_p.add_argument("value", type=float, help="Threshold percentage (1.0 - 100.0)")
+
+    set_max_p = cb_sub.add_parser("set-max", help="Set max deletion threshold file count (e.g. 100)")
+    set_max_p.add_argument("value", type=int, help="Threshold count (number of files)")
 
     # Doctor subcommand
     subparsers.add_parser("doctor", help="Run diagnostic health checks")
@@ -414,9 +593,21 @@ def main():
     # Logs subcommand
     logs_parser = subparsers.add_parser("logs", help="View background service logs")
     logs_parser.add_argument("--tail", type=int, default=50, help="Number of lines to show")
+    logs_parser.add_argument("-f", "--follow", action="store_true", help="Follow log output in real time (like tail -f)")
 
     args = parser.parse_args()
     config = Config()
+
+    if args.debug:
+        print(f"[DEBUG] CLI Subcommand: {args.subcommand}")
+        print(f"[DEBUG] sys.executable: {sys.executable}")
+        print(f"[DEBUG] sys.frozen: {getattr(sys, 'frozen', False)}")
+        print(f"[DEBUG] Base Directory: {config.base_dir}")
+        print(f"[DEBUG] Config File: {config.config_path}")
+        print(f"[DEBUG] Database File: {config.db_path}")
+        print(f"[DEBUG] Log File: {config.log_path}")
+        print(f"[DEBUG] Rclone Binary: {config.get('rclone_binary')}")
+        print(f"[DEBUG] Rclone Conf: {config.get('rclone_conf')}")
 
     if args.subcommand == "auth":
         if args.auth_action == "login":
@@ -425,6 +616,8 @@ def main():
             cmd_auth_status(args, config)
         elif args.auth_action == "clear":
             cmd_auth_clear(args, config)
+        elif args.auth_action == "credentials":
+            cmd_auth_set_credentials(args, config)
         else:
             auth_parser.print_help()
 
@@ -440,6 +633,8 @@ def main():
 
     elif args.subcommand == "start":
         cmd_start(args, config)
+    elif args.subcommand == "daemon":
+        cmd_daemon_run(args, config)
     elif args.subcommand == "stop":
         cmd_stop(args, config)
     elif args.subcommand == "status":
@@ -451,7 +646,10 @@ def main():
     elif args.subcommand == "autostart":
         cmd_autostart(args, config)
     elif args.subcommand == "circuit-breaker":
-        cmd_circuit_breaker(args, config)
+        if args.cb_action:
+            cmd_circuit_breaker(args, config)
+        else:
+            cb_parser.print_help()
     elif args.subcommand == "doctor":
         cmd_doctor(args, config)
     elif args.subcommand == "logs":
