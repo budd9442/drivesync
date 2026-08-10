@@ -340,3 +340,23 @@ class Storage:
                 ("true" if tripped else "false",),
             )
             conn.commit()
+
+    def is_resync_completed(self, local_path: str) -> bool:
+        norm_p = normalize_local_path(local_path)
+        key = f"resync_completed_{norm_p}"
+        with self.get_connection() as conn:
+            row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
+            return row["value"] == "true" if row else False
+
+    def set_resync_completed(self, local_path: str, completed: bool) -> None:
+        norm_p = normalize_local_path(local_path)
+        key = f"resync_completed_{norm_p}"
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO system_state (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, "true" if completed else "false"),
+            )
+            conn.commit()

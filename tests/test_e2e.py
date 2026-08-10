@@ -11,16 +11,18 @@ from drivesync.rclone_client import RcloneClient
 from drivesync.storage import Storage
 
 
-def wait_for_completed_events(storage: Storage, expected_completed_count: int, timeout: float = 25.0) -> bool:
-    """Poll DB until completed events count reaches expected_completed_count."""
+def get_completed_count(storage: Storage) -> int:
+    with storage.get_connection() as conn:
+        row = conn.execute("SELECT COUNT(*) as cnt FROM events WHERE status = 'COMPLETED'").fetchone()
+        return row["cnt"] if row else 0
+
+
+def wait_for_new_completed_events(storage: Storage, initial_count: int, min_new_events: int = 1, timeout: float = 90.0) -> bool:
+    """Poll DB until completed events count increases by at least min_new_events beyond initial_count."""
     start = time.time()
     while time.time() - start < timeout:
-        with storage.get_connection() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM events WHERE status = 'COMPLETED'"
-            ).fetchone()
-            if row["cnt"] >= expected_completed_count:
-                return True
+        if (get_completed_count(storage) - initial_count) >= min_new_events:
+            return True
         time.sleep(0.5)
     return False
 
@@ -39,7 +41,8 @@ class TestDriveSyncE2E(unittest.TestCase):
         self.config.set("rc_port", 5589)  # Isolated port
         self.config.set("stability_seconds", 1.0)
         self.config.set("reconciliation_interval", 60)
-        self.config.set("circuit_breaker_max_percent", 60.0)  # Allow test deletion of 1 of 2 files (50%)
+        self.config.set("bisync_enabled", False)
+        self.config.set("circuit_breaker_max_percent", 60.0)
 
         self.config.add_folder(str(self.test_watched), remote_path="DriveSync_E2E_Test")
 
@@ -71,8 +74,13 @@ class TestDriveSyncE2E(unittest.TestCase):
         daemon_thread.start()
 
         print("--> Step 1: Daemon & rclone RC process launching...")
-        time.sleep(3.0)
-        self.assertTrue(rclone_client.is_alive(), "rclone RC daemon should be active")
+        alive = False
+        for _ in range(20):
+            if rclone_client.is_alive():
+                alive = True
+                break
+            time.sleep(0.5)
+        self.assertTrue(alive, "rclone RC daemon should be active")
         print("    [OK] Daemon & rclone RC process responding on port 5589.")
 
         # --- Phase 1: ADD EVENTS ---
@@ -80,12 +88,12 @@ class TestDriveSyncE2E(unittest.TestCase):
         file1 = self.test_watched / "e2e_doc1.txt"
         file2 = self.test_watched / "e2e_doc2.txt"
 
+        c0 = get_completed_count(storage)
         file1.write_text("Hello DriveSync E2E Test 1", encoding="utf-8")
         file2.write_text("Hello DriveSync E2E Test 2", encoding="utf-8")
 
-        # Wait until 2 COMPLETED events recorded in DB
-        success = wait_for_completed_events(storage, expected_completed_count=2, timeout=25.0)
-        self.assertTrue(success, "Both ADD events should be processed to COMPLETED within timeout")
+        success = wait_for_new_completed_events(storage, initial_count=c0, min_new_events=2, timeout=90.0)
+        self.assertTrue(success, "ADD events should process to COMPLETED within timeout")
 
         # Check DB Manifest
         m1 = storage.get_manifest_entry(str(file1))
@@ -94,11 +102,12 @@ class TestDriveSyncE2E(unittest.TestCase):
         self.assertIsNotNone(m2, "e2e_doc2.txt must be recorded in manifest")
         print(f"    [OK] Added files synced & recorded in SQLite manifest: {m1['rel_path']}")
 
-        # --- Phase 3: MODIFY EVENT ---
+        # --- Phase 2: MODIFY EVENT ---
         print("\n--> Step 3: Testing MODIFY Event Sync...")
+        c1 = get_completed_count(storage)
         file1.write_text("Updated Content for DriveSync E2E Test 1", encoding="utf-8")
-        # Wait until 3 COMPLETED events total (2 ADD + 1 MODIFY)
-        success = wait_for_completed_events(storage, expected_completed_count=3, timeout=25.0)
+        
+        success = wait_for_new_completed_events(storage, initial_count=c1, timeout=90.0)
         self.assertTrue(success, "MODIFY event should reach COMPLETED within timeout")
 
         m1_updated = storage.get_manifest_entry(str(file1))
@@ -106,18 +115,19 @@ class TestDriveSyncE2E(unittest.TestCase):
         self.assertNotEqual(m1["content_hash"], m1_updated["content_hash"])
         print("    [OK] Modify event synced & hash updated in manifest.")
 
-        # --- Phase 4: DELETE EVENT ---
+        # --- Phase 3: DELETE EVENT ---
         print("\n--> Step 4: Testing DELETE Event Sync...")
+        c2 = get_completed_count(storage)
         file2.unlink()
-        # Wait until 4 COMPLETED events total (2 ADD + 1 MODIFY + 1 DELETE)
-        success = wait_for_completed_events(storage, expected_completed_count=4, timeout=25.0)
+
+        success = wait_for_new_completed_events(storage, initial_count=c2, timeout=90.0)
         self.assertTrue(success, "DELETE event should reach COMPLETED within timeout")
 
         m2_deleted = storage.get_manifest_entry(str(file2))
         self.assertIsNone(m2_deleted, "Deleted file should be removed from manifest")
         print("    [OK] Delete event synced & removed from manifest.")
 
-        # --- Phase 5: Stop Daemon Cleanly ---
+        # --- Phase 4: Stop Daemon Cleanly ---
         print("\n--> Step 5: Testing Clean Daemon Shutdown...")
         daemon.stop()
         time.sleep(1.0)

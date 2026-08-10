@@ -101,7 +101,9 @@ class RcloneClient:
             self.process = None
         logger.info("rclone daemon process stopped.")
 
-    def _call_rc(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+    def _call_rc(
+        self, endpoint: str, data: Optional[Dict[str, Any]] = None, timeout: float = 60.0
+    ) -> Tuple[int, Dict[str, Any]]:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         payload = json.dumps(data or {}).encode("utf-8")
 
@@ -116,7 +118,7 @@ class RcloneClient:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=10.0) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 status = resp.status
                 body = resp.read().decode("utf-8")
                 res_json = json.loads(body) if body else {}
@@ -132,7 +134,7 @@ class RcloneClient:
 
     def is_alive(self) -> bool:
         """Health check endpoint ping."""
-        code, resp = self._call_rc("core/pid")
+        code, resp = self._call_rc("core/pid", timeout=5.0)
         return code == 200 and "pid" in resp
 
     def copy_file(self, local_path: str, remote_name: str, remote_rel_path: str) -> Tuple[bool, str]:
@@ -161,7 +163,7 @@ class RcloneClient:
             "dstRemote": dst_remote,
         }
 
-        code, resp = self._call_rc("operations/copyfile", payload)
+        code, resp = self._call_rc("operations/copyfile", payload, timeout=120.0)
         if code == 200:
             return True, "Success"
         error_msg = resp.get("error", f"HTTP {code}")
@@ -179,7 +181,7 @@ class RcloneClient:
 
         payload = {"fs": fs, "remote": remote_file}
 
-        code, resp = self._call_rc("operations/deletefile", payload)
+        code, resp = self._call_rc("operations/deletefile", payload, timeout=60.0)
         if code == 200:
             return True, "Success"
         error_msg = resp.get("error", f"HTTP {code}")
@@ -192,7 +194,79 @@ class RcloneClient:
         fs = f"{remote_name}:" if dst_dir == "." else f"{remote_name}:{dst_dir}"
         payload = {"fs": fs, "remote": remote_rel_p.name}
 
-        code, resp = self._call_rc("operations/stat", payload)
+        code, resp = self._call_rc("operations/stat", payload, timeout=30.0)
         if code == 200 and "item" in resp and resp["item"] is not None:
             return True, resp["item"]
         return False, None
+
+    def move_file(self, src_fs: str, src_remote: str, dst_fs: str, dst_remote: str) -> bool:
+        """Move a remote file from src to dst (e.g. to move to remote Trash folder)."""
+        payload = {
+            "srcFs": src_fs,
+            "srcRemote": src_remote,
+            "dstFs": dst_fs,
+            "dstRemote": dst_remote,
+        }
+        code, resp = self._call_rc("operations/movefile", payload, timeout=60.0)
+        return code == 200
+
+    def run_bisync(
+        self,
+        local_path: str,
+        remote_name: str,
+        remote_path: str,
+        resync: bool = False,
+        conflict_resolve: str = "newer",
+        max_deletes: int = 50,
+    ) -> Tuple[bool, str]:
+        """
+        Execute native 2-way rclone bisync command with trash safety backup directories.
+        """
+        local_p = pathlib.Path(local_path).resolve()
+        remote_spec = f"{remote_name}:{remote_path.strip('/')}"
+
+        local_appdata = os.environ.get("LOCALAPPDATA", str(pathlib.Path.home() / ".drivesync"))
+        local_trash = pathlib.Path(local_appdata) / "DriveSync" / "Trash" / "bisync_local"
+        local_trash.mkdir(parents=True, exist_ok=True)
+        remote_trash = f"{remote_name}:DriveSync_Trash"
+
+        cmd = [
+            self.rclone_binary,
+            "bisync",
+            str(local_p),
+            remote_spec,
+            f"--config={self.rclone_conf}",
+            f"--conflict-resolve={conflict_resolve}",
+            f"--max-delete={max_deletes}",
+            f"--backup-dir1={str(local_trash)}",
+            f"--backup-dir2={remote_trash}",
+            "--verbose",
+        ]
+
+        if resync:
+            cmd.append("--resync")
+
+        logger.info(f"Running rclone bisync (resync={resync}): {' '.join(cmd)}")
+        try:
+            creation_flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+            res = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=creation_flags,
+                timeout=300.0,
+            )
+            if res.returncode == 0:
+                logger.info(f"rclone bisync completed successfully for {local_p}")
+                return True, "Success"
+            else:
+                err_msg = res.stderr.strip() or res.stdout.strip()
+                logger.error(f"rclone bisync failed (code {res.returncode}): {err_msg[:300]}")
+                return False, f"bisync failed: {err_msg[:300]}"
+        except subprocess.TimeoutExpired:
+            logger.error(f"rclone bisync timed out after 300s for {local_p}")
+            return False, "bisync timed out after 300s"
+        except Exception as e:
+            logger.error(f"rclone bisync error: {e}")
+            return False, str(e)

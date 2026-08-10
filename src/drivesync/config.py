@@ -44,16 +44,14 @@ class Config:
         self.load()
 
     def _auto_detect_rclone_binary(self) -> str:
-        # Check current working directory or workspace path first
+        from drivesync.rclone_installer import ensure_rclone_binary
+
         dev_rclone = pathlib.Path.cwd() / "rclone.exe"
         if dev_rclone.exists():
             return str(dev_rclone.resolve())
 
-        bin_rclone = self.base_dir / "bin" / "rclone.exe"
-        if bin_rclone.exists():
-            return str(bin_rclone.resolve())
-
-        return "rclone"
+        detected = ensure_rclone_binary(target_dir=self.base_dir)
+        return detected or "rclone"
 
     def _auto_detect_rclone_conf(self) -> str:
         dev_conf = pathlib.Path.cwd() / "rclone.conf"
@@ -79,6 +77,10 @@ class Config:
             "circuit_breaker_max_percent": 20.0,
             "ignore_patterns": DEFAULT_IGNORE_PATTERNS.copy(),
             "reconciliation_interval": 300,
+            "bisync_enabled": True,
+            "bisync_interval": 300,
+            "bisync_conflict_resolve": "newer",
+            "bisync_max_deletes": 50,
         }
 
     def load(self) -> None:

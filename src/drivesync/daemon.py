@@ -76,13 +76,36 @@ class DriveSyncDaemon:
             except Exception:
                 pass
 
-    def run_reconciliation(self) -> None:
-        """Run periodic/startup reconciliation diff scan across all watched folders."""
-        logger.info("Starting directory reconciliation scan...")
+    def run_reconciliation(self, force_resync: bool = False) -> None:
+        """Run periodic/startup 2-way rclone bisync and local directory reconciliation diff scan."""
+        logger.info("Starting 2-way bisync reconciliation scan...")
+        remote_name = self.config.get("rclone_remote", "gdrive")
+        bisync_enabled = self.config.get("bisync_enabled", True)
+        conflict_resolve = self.config.get("bisync_conflict_resolve", "newer")
+        max_deletes = self.config.get("bisync_max_deletes", 50)
+
         total_a, total_m, total_d = 0, 0, 0
 
         for folder in self.config.watched_folders:
             local_path = folder["local_path"]
+            remote_path = folder["remote_path"]
+
+            if bisync_enabled:
+                needs_resync = force_resync or not self.storage.is_resync_completed(local_path)
+                ok, msg = self.rclone_client.run_bisync(
+                    local_path=local_path,
+                    remote_name=remote_name,
+                    remote_path=remote_path,
+                    resync=needs_resync,
+                    conflict_resolve=conflict_resolve,
+                    max_deletes=max_deletes,
+                )
+                if ok:
+                    self.storage.set_resync_completed(local_path, True)
+                else:
+                    logger.warning(f"bisync run for {local_path} returned: {msg}")
+
+            # Refresh local manifest state post-bisync
             a, m, d = self.storage.reconcile_folder(
                 local_path, self.config.get("ignore_patterns", [])
             )
@@ -91,7 +114,7 @@ class DriveSyncDaemon:
             total_d += d
 
         logger.info(
-            f"Reconciliation scan complete. Enqueued: {total_a} added, {total_m} modified, {total_d} deleted."
+            f"2-Way Reconciliation complete. Enqueued: {total_a} added, {total_m} modified, {total_d} deleted."
         )
 
     def start(self) -> None:

@@ -80,6 +80,32 @@ def cmd_auth_status(args: argparse.Namespace, config: Config) -> None:
         print(f"[STATUS] Auth status error: {e}")
 
 
+def cmd_auth_clear(args: argparse.Namespace, config: Config) -> None:
+    rclone_conf = pathlib.Path(config.get("rclone_conf"))
+    remote_name = config.get("rclone_remote", "gdrive")
+
+    if rclone_conf.exists():
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read(rclone_conf, encoding="utf-8")
+
+            if cp.has_section(remote_name):
+                cp.remove_section(remote_name)
+                with open(rclone_conf, "w", encoding="utf-8") as f:
+                    cp.write(f)
+                print(f"[SUCCESS] Credentials for remote '{remote_name}' removed from {rclone_conf}.")
+            else:
+                print(f"No credentials section found for '{remote_name}'.")
+        except Exception:
+            rclone_conf.unlink(missing_ok=True)
+            print(f"[SUCCESS] Removed rclone configuration file: {rclone_conf}")
+    else:
+        print("No stored rclone credentials found.")
+
+    print("Run 'drivesync auth login' to authenticate with a Google Drive account.")
+
+
 def cmd_folders_add(args: argparse.Namespace, config: Config) -> None:
     local_p = pathlib.Path(args.path).resolve()
     if not local_p.exists() or not local_p.is_dir():
@@ -282,6 +308,60 @@ def cmd_logs(args: argparse.Namespace, config: Config) -> None:
         print("".join(tail), end="")
 
 
+def cmd_resync(args: argparse.Namespace, config: Config) -> None:
+    storage = Storage(config.db_path)
+    client = RcloneClient(
+        rclone_binary=config.get("rclone_binary"),
+        rclone_conf=config.get("rclone_conf"),
+    )
+    remote_name = config.get("rclone_remote", "gdrive")
+    folders = config.watched_folders
+
+    if not folders:
+        print("[ERROR] No watched folders configured.")
+        return
+
+    print("Triggering manual 2-way rclone bisync (--resync)...")
+    for f in folders:
+        local_p = f["local_path"]
+        remote_p = f["remote_path"]
+        if args.path and pathlib.Path(args.path).resolve() != pathlib.Path(local_p).resolve():
+            continue
+
+        print(f"Running bisync --resync for {local_p} -> {remote_name}:{remote_p}...")
+        ok, msg = client.run_bisync(
+            local_path=local_p,
+            remote_name=remote_name,
+            remote_path=remote_p,
+            resync=True,
+            conflict_resolve=config.get("bisync_conflict_resolve", "newer"),
+            max_deletes=config.get("bisync_max_deletes", 50),
+        )
+        if ok:
+            storage.set_resync_completed(local_p, True)
+            storage.reconcile_folder(local_p, config.get("ignore_patterns", []))
+            print(f"[SUCCESS] 2-Way bisync resync complete for {local_p}")
+        else:
+            print(f"[ERROR] bisync failed for {local_p}: {msg}")
+
+
+def cmd_trash(args: argparse.Namespace, config: Config) -> None:
+    from drivesync.trash import TrashManager
+
+    trash_mgr = TrashManager()
+    if args.trash_action == "list":
+        items = trash_mgr.list_trash_items()
+        if not items:
+            print("Local safety trash folder is empty.")
+        else:
+            print(f"Local Safety Trash Items ({len(items)} files):")
+            for item in items:
+                print(f"  - {item}")
+    elif args.trash_action == "clear":
+        count = trash_mgr.clear_trash()
+        print(f"[SUCCESS] Purged {count} file(s) from local safety trash.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="drivesync",
@@ -295,6 +375,7 @@ def main():
     login_p = auth_sub.add_parser("login", help="Run OAuth login flow via rclone")
     login_p.add_argument("--remote-path", help="Remote name to configure (default: gdrive)")
     auth_sub.add_parser("status", help="Check Google Drive auth status")
+    auth_sub.add_parser("clear", help="Clear stored Google Drive credentials and log out")
 
     # Folders subparser
     folders_parser = subparsers.add_parser("folders", help="Manage watched local folders")
@@ -310,6 +391,14 @@ def main():
     subparsers.add_parser("start", help="Start background sync service")
     subparsers.add_parser("stop", help="Stop background sync service")
     subparsers.add_parser("status", help="Show current daemon and queue status")
+
+    # Resync subcommand
+    resync_p = subparsers.add_parser("resync", help="Run manual 2-way rclone bisync --resync")
+    resync_p.add_argument("path", nargs="?", help="Optional local folder path to resync")
+
+    # Trash subparser
+    trash_parser = subparsers.add_parser("trash", help="Manage local safety trash folder")
+    trash_parser.add_argument("trash_action", choices=["list", "clear"])
 
     # Autostart subparser
     autostart_parser = subparsers.add_parser("autostart", help="Configure user-level autostart")
@@ -334,6 +423,8 @@ def main():
             cmd_auth_login(args, config)
         elif args.auth_action == "status":
             cmd_auth_status(args, config)
+        elif args.auth_action == "clear":
+            cmd_auth_clear(args, config)
         else:
             auth_parser.print_help()
 
@@ -353,6 +444,10 @@ def main():
         cmd_stop(args, config)
     elif args.subcommand == "status":
         cmd_status(args, config)
+    elif args.subcommand == "resync":
+        cmd_resync(args, config)
+    elif args.subcommand == "trash":
+        cmd_trash(args, config)
     elif args.subcommand == "autostart":
         cmd_autostart(args, config)
     elif args.subcommand == "circuit-breaker":

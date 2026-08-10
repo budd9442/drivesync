@@ -1,3 +1,4 @@
+import datetime
 import logging
 import os
 import time
@@ -159,9 +160,18 @@ class SyncManager:
                     is_perm = not is_transient_error(error_msg) if not success else False
 
             elif op == "DELETE":
-                success, error_msg = self.rclone_client.delete_file(
-                    remote_name, remote_full_path
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                trash_remote_path = f"DriveSync_Trash/{timestamp}/{rel_path.lstrip('/')}"
+                success = self.rclone_client.move_file(
+                    f"{remote_name}:", remote_full_path, f"{remote_name}:", trash_remote_path
                 )
+                if not success:
+                    # Fallback to delete_file (which moves to Google Drive native trash)
+                    success, error_msg = self.rclone_client.delete_file(
+                        remote_name, remote_full_path
+                    )
+                else:
+                    error_msg = ""
                 is_perm = not is_transient_error(error_msg) if not success else False
 
             if success:

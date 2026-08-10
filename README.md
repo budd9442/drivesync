@@ -109,21 +109,48 @@ drivesync autostart status
 
 ---
 
+## 💻 Deploying Standalone Windows `.exe` (Zero Dependencies)
+
+DriveSync can be compiled into a standalone, single-file Windows executable (`drivesync.exe`) that runs on **any Windows PC without requiring Python or any dependencies to be preinstalled**!
+
+### Option A: Use the Compiled `drivesync.exe`
+1. Copy `dist/drivesync.exe` to any folder on the new Windows PC (e.g. `%LOCALAPPDATA%\DriveSync` or `C:\Tools\drivesync.exe`).
+2. Run directly from CMD or PowerShell:
+   ```cmd
+   drivesync.exe auth login
+   drivesync.exe folders add "C:\Users\YourUser\Documents\Folder"
+   drivesync.exe start
+   drivesync.exe autostart enable
+   ```
+   *`drivesync.exe` will automatically download `rclone.exe` on first launch if not found!*
+
+### Option B: Build Your Own `drivesync.exe`
+To compile the single-file executable from source:
+```cmd
+python build_exe.py
+```
+Output executable is generated at `dist/drivesync.exe`.
+
+---
+
 ## 💻 CLI Subcommand Reference
 
 | Command | Subcommand / Action | Description |
 | :--- | :--- | :--- |
 | **`drivesync auth`** | `login [--remote-path NAME]` | Launch Google Drive OAuth consent flow via rclone. |
 | | `status` | Test and verify Google Drive remote authorization state. |
+| | `clear` | Purge stored Google Drive credentials from rclone configuration. |
 | **`drivesync folders`** | `add <path> [--remote-path PATH]` | Register a local folder for continuous synchronization. |
 | | `remove <path>` | Unregister a local folder from sync. |
 | | `list` | Display a formatted table of all watched folders and remote paths. |
 | **`drivesync start`** | — | Launch background service daemon (`drivesync.daemon`). |
 | **`drivesync stop`** | — | Send termination signal to running background daemon process. |
 | **`drivesync status`** | — | Show daemon PID, watched folder count, queue metrics, and breaker status. |
+| **`drivesync resync`** | `[path]` | Trigger a manual 2-Way `rclone bisync --resync` baseline run on demand. |
+| **`drivesync trash`** | `list \| clear` | Manage local safety trash folder (`%LOCALAPPDATA%\DriveSync\Trash`). |
 | **`drivesync autostart`** | `enable \| disable \| status` | Manage HKCU Windows registry Run key autostart. |
 | **`drivesync circuit-breaker`** | `approve \| status \| reset` | Inspect or clear safety circuit breaker after mass deletion halts. |
-| **`drivesync doctor`** | — | Run 7-point diagnostic health suite (rclone, DB WAL, disk space, etc.). |
+| **`drivesync doctor`** | — | Run 7-point diagnostic health suite (rclone binary, DB WAL, disk space, etc.). |
 | **`drivesync logs`** | `[--tail N]` | View recent service logs from `%LOCALAPPDATA%\DriveSync\logs\drivesync.log`. |
 
 ---
