@@ -34,12 +34,12 @@ class TestCliDaemon(unittest.TestCase):
         """Verify daemon command resolution in frozen vs non-frozen modes."""
         with patch.object(sys, "frozen", True, create=True):
             cmd_frozen = _get_daemon_command()
-            self.assertIn("daemon", cmd_frozen)
+            self.assertIn("start", cmd_frozen)
             self.assertNotIn("-m", cmd_frozen)
 
         with patch.object(sys, "frozen", False, create=True):
             cmd_normal = _get_daemon_command()
-            self.assertIn("-m drivesync.daemon", cmd_normal)
+            self.assertIn("start", cmd_normal)
 
     @patch("subprocess.Popen")
     def test_cmd_start_frozen(self, mock_popen):

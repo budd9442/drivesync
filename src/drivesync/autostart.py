@@ -11,16 +11,22 @@ REG_VAL_NAME = "DriveSync"
 
 
 def _get_daemon_command() -> str:
-    """Construct command to run daemon in background."""
+    """Construct native windowless autostart command for Windows registry."""
     python_exe = sys.executable
     if getattr(sys, "frozen", False):
-        return f'"{python_exe}" daemon'
-    return f'"{python_exe}" -m drivesync.daemon'
+        # Native PowerShell hidden process launch (0 extra files on disk, 0 VBS scripts)
+        return f'powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath \'{python_exe}\' -ArgumentList \'start\' -WindowStyle Hidden"'
+
+    pythonw = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
+    if os.path.exists(pythonw):
+        return f'"{pythonw}" -m drivesync.cli start'
+    return f'"{python_exe}" -m drivesync.cli start'
 
 
 def enable_autostart() -> bool:
     """
     Enable automatic startup at user login using per-user HKCU registry key.
+    Uses native Windows hidden execution (zero VBS script files required).
     Requires ZERO admin rights.
     """
     cmd = _get_daemon_command()
@@ -45,11 +51,11 @@ def enable_autostart() -> bool:
             cmd_file = startup_dir / "DriveSync.cmd"
             try:
                 with open(cmd_file, "w", encoding="utf-8") as f:
-                    f.write(f"@echo off\nstart /b {cmd}\n")
-                logger.info(f"Autostart batch fallback created at {cmd_file}")
+                    f.write(f"@echo off\n{cmd}\n")
+                logger.info(f"Autostart fallback script created at {cmd_file}")
                 return True
             except Exception as e:
-                logger.error(f"Failed to write startup batch script: {e}")
+                logger.error(f"Failed to write startup script: {e}")
 
     return False
 
@@ -73,16 +79,18 @@ def disable_autostart() -> bool:
         except Exception as e:
             logger.error(f"Failed to remove HKCU registry autostart: {e}")
 
-    # Also clean fallback file if exists
+    # Clean legacy fallback scripts if exist
     appdata = os.environ.get("APPDATA")
     if appdata:
-        cmd_file = pathlib.Path(appdata) / r"Microsoft\Windows\Start Menu\Programs\Startup\DriveSync.cmd"
-        if cmd_file.exists():
-            try:
-                cmd_file.unlink()
-                success = True
-            except Exception as e:
-                logger.error(f"Failed to delete startup batch script: {e}")
+        startup_dir = pathlib.Path(appdata) / r"Microsoft\Windows\Start Menu\Programs\Startup"
+        for name in ("DriveSync.vbs", "DriveSync.cmd"):
+            cmd_file = startup_dir / name
+            if cmd_file.exists():
+                try:
+                    cmd_file.unlink()
+                    success = True
+                except Exception as e:
+                    logger.error(f"Failed to delete startup script: {e}")
 
     return success
 
@@ -104,8 +112,9 @@ def is_autostart_enabled() -> bool:
 
     appdata = os.environ.get("APPDATA")
     if appdata:
-        cmd_file = pathlib.Path(appdata) / r"Microsoft\Windows\Start Menu\Programs\Startup\DriveSync.cmd"
-        if cmd_file.exists():
-            return True
+        startup_dir = pathlib.Path(appdata) / r"Microsoft\Windows\Start Menu\Programs\Startup"
+        for name in ("DriveSync.vbs", "DriveSync.cmd"):
+            if (startup_dir / name).exists():
+                return True
 
     return False
